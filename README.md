@@ -1,0 +1,80 @@
+# Secret Lair Drop Monitor
+
+Monitors the [Secret Lair](https://secretlair.wizards.com/us/) store and [Chaos Vault](https://secretlair.wizards.com/us/chaosvault) for new product drops. Sends notifications to a Discord channel via webhook when new items appear.
+
+## What it monitors
+
+- **Main store** (`/us/`) — Featured drops and homepage products
+- **Chaos Vault** (`/us/chaosvault`) — Detects when the vault opens/closes and alerts immediately
+- **Shop All** (`/us/shopall`) — Catches products that may not be on the homepage (optional, enabled by default)
+
+## Features
+
+- Detects new product additions by tracking product IDs
+- Special "CHAOS VAULT IS OPEN" alert when the vault transitions from closed to active
+- Rich Discord embeds with product name, price, and direct link
+- Persists state across restarts (won't re-notify on reboot)
+- First run silently catalogues existing products (no spam on initial deploy)
+- Rate-limit aware for Discord API
+
+## Setup
+
+### 1. Create a Discord Webhook
+
+In your Discord server: **Server Settings > Integrations > Webhooks > New Webhook**
+
+Pick the channel you want alerts in, copy the webhook URL.
+
+### 2. Configure
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set your webhook URL:
+
+```
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1234567890/aBcDeFgHiJkLmNoPqRsT
+```
+
+### 3. Deploy
+
+```bash
+docker compose up -d
+```
+
+Check logs:
+```bash
+docker compose logs -f
+```
+
+## Configuration
+
+All config is via environment variables (set in `.env`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISCORD_WEBHOOK_URL` | *(required)* | Discord webhook URL |
+| `POLL_INTERVAL_SECONDS` | `180` | Seconds between checks |
+| `MONITOR_SHOP_ALL` | `true` | Also monitor `/us/shopall` |
+| `NOTIFY_ON_START` | `false` | Notify for existing products on first run |
+| `LOG_LEVEL` | `INFO` | Log verbosity |
+
+## How It Works
+
+1. On startup, fetches all monitored pages and parses product links from the HTML
+2. Product IDs (the numeric ID in `/us/product/1249999`) are the unique key
+3. First run stores all current products silently (no notification flood)
+4. Subsequent checks compare against known state — new IDs trigger Discord alerts
+5. The Chaos Vault page is checked for whether it has any product listings. When products appear, a special high-visibility alert fires.
+6. State is written to `state.json` after every cycle
+
+## Troubleshooting
+
+**No notifications on first run** — This is by design. Set `NOTIFY_ON_START=true` if you want alerts for existing products.
+
+**Products not detected** — The scraper looks for `/us/product/{id}` links in the HTML. If Wizards changes their URL structure or moves to fully client-rendered content, the regex patterns may need updating. Check logs at `LOG_LEVEL=DEBUG`.
+
+**Rate limited** — The monitor handles Discord 429 responses automatically. If the site itself rate-limits you, increase `POLL_INTERVAL_SECONDS`.
+
+**State reset** — Delete the `data/` directory to start fresh. The next run will re-catalogue everything.
