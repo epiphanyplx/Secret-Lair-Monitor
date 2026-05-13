@@ -22,6 +22,14 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "180"))  # 3 min default
+# While the site is down (likely a pre-release maintenance window), poll faster
+# so we catch the new drop quickly once it's back.
+MAINTENANCE_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MAINTENANCE_POLL_INTERVAL_SECONDS", "60")
+)
+# How many consecutive failed checks before declaring maintenance mode. Filters
+# out transient network blips so we don't ping Discord for one-off failures.
+MAINTENANCE_STRIKE_THRESHOLD = int(os.environ.get("MAINTENANCE_STRIKE_THRESHOLD", "2"))
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 USER_AGENT = os.environ.get(
@@ -85,16 +93,49 @@ PRODUCT_LINK_RE = re.compile(r"/us/product/(\d+)(?:/([^\"'\s]*))?")
 
 
 def fetch_page(url: str) -> str | None:
-    """Fetch a page's HTML. Returns None on failure."""
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+    """Fetch a page's HTML. Returns None on failure.
+
+    Sends cache-busting headers so we don't get a stale 'we'll be right back'
+    page from a CDN edge after Wizards brings the site back online.
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    sep = "&" if "?" in url else "?"
+    bust_url = f"{url}{sep}_={int(time.time())}"
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
+        resp = requests.get(bust_url, headers=headers, timeout=30)
         resp.raise_for_status()
         return resp.text
     except requests.RequestException as e:
-        log.error("Failed to fetch %s: %s", url, e)
-        send_discord_error_notification(str(e), context=f"Failed to fetch `{url}`")
+        log.warning("Failed to fetch %s: %s", url, e)
         return None
+
+
+# Phrases that indicate Wizards has the site behind a maintenance/holding page
+# (HTTP 200, but the body says it's down). Matched case-insensitively.
+_MAINTENANCE_INDICATORS = (
+    "we'll be right back",
+    "we will be right back",
+    "be right back",
+    "under maintenance",
+    "site is temporarily unavailable",
+    "temporarily unavailable",
+    "503 service unavailable",
+    "service is unavailable",
+    "site is currently down",
+)
+
+
+def is_maintenance_page(html: str | None) -> bool:
+    """Detect a 'site down' holding page that loaded as 200 OK."""
+    if not html:
+        return False
+    lower = html.lower()
+    return any(indicator in lower for indicator in _MAINTENANCE_INDICATORS)
 
 
 def parse_products(html: str) -> dict[str, dict]:
@@ -233,6 +274,45 @@ def send_discord_notification(products: list[dict], source: str) -> bool:
     return True
 
 
+def send_release_soon_notification() -> bool:
+    """One-shot notification fired when the site goes into maintenance mode.
+
+    Replaces the per-fetch error spam that used to fire during the multi-hour
+    pre-release window.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return False
+
+    payload = {
+        "username": "Secret Lair Monitor",
+        "avatar_url": "https://cdn-prod.scalefast.com/public/assets/img/resized/"
+                      "wizardsofthecoast-secret-lair/favicon-32.png",
+        "content": "**🃏 Secret Lair Releasing Soon!**",
+        "embeds": [
+            {
+                "title": "Secret Lair site is down",
+                "url": "https://secretlair.wizards.com/us/",
+                "color": 0xF1C40F,  # Yellow
+                "description": (
+                    "The Secret Lair site is currently unavailable, which usually "
+                    "means a new drop is about to go live. Monitoring more "
+                    "frequently — you'll get a notification as soon as the new "
+                    "products appear."
+                ),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    }
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        log.info("'Releasing Soon' notification sent")
+        return True
+    except requests.RequestException as e:
+        log.error("Failed to send 'Releasing Soon' notification: %s", e)
+        return False
+
+
 def send_chaos_vault_opened_notification() -> bool:
     """Special notification when the Chaos Vault transitions from closed to open."""
     if not DISCORD_WEBHOOK_URL:
@@ -312,16 +392,52 @@ def send_discord_error_notification(error_msg: str, context: str = "") -> bool:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_check(state: dict) -> dict:
-    """Run one check cycle across all monitored pages."""
+def run_check(state: dict) -> tuple[dict, bool]:
+    """Run one check cycle across all monitored pages.
+
+    Returns (state, in_maintenance). When the site is in maintenance mode we
+    skip product parsing and let the caller use a faster poll interval.
+    """
     known = state.get("known_products", {})
     chaos_vault_was_active = state.get("chaos_vault_active", False)
+    was_in_maintenance = state.get("maintenance_mode", False)
+    strikes = state.get("maintenance_strikes", 0)
 
+    # Use the main store page as the canonical signal for site health. The
+    # chaos vault page is legitimately empty most of the time, and shop_all
+    # can lag, so we don't want either to be the trigger.
+    store_html = fetch_page(PAGES["store"])
+    store_down = store_html is None or is_maintenance_page(store_html)
+
+    if store_down:
+        strikes += 1
+        log.info(
+            "Secret Lair store appears down (strike %d/%d)",
+            strikes,
+            MAINTENANCE_STRIKE_THRESHOLD,
+        )
+        state["maintenance_strikes"] = strikes
+        if strikes >= MAINTENANCE_STRIKE_THRESHOLD and not was_in_maintenance:
+            send_release_soon_notification()
+            state["maintenance_mode"] = True
+        state["last_check"] = datetime.now(timezone.utc).isoformat()
+        return state, state.get("maintenance_mode", False)
+
+    # Site is up — reset strike counter and announce recovery if needed.
+    state["maintenance_strikes"] = 0
+    if was_in_maintenance:
+        log.info("Secret Lair site is back online — checking for new products")
+        state["maintenance_mode"] = False
+
+    # Process the store page we already fetched, then the rest.
     for source, url in PAGES.items():
-        log.debug("Checking %s: %s", source, url)
-        html = fetch_page(url)
-        if html is None:
-            continue
+        if source == "store":
+            html = store_html
+        else:
+            log.debug("Checking %s: %s", source, url)
+            html = fetch_page(url)
+            if html is None:
+                continue
 
         # Special Chaos Vault open/close detection
         if source == "chaos_vault":
@@ -351,7 +467,7 @@ def run_check(state: dict) -> dict:
 
     state["known_products"] = known
     state["last_check"] = datetime.now(timezone.utc).isoformat()
-    return state
+    return state, False
 
 
 def main() -> None:
@@ -381,7 +497,7 @@ def main() -> None:
         if not notify_on_start:
             globals()["DISCORD_WEBHOOK_URL"] = ""
 
-        state = run_check(state)
+        state, _ = run_check(state)
         save_state(state)
 
         if not notify_on_start:
@@ -392,9 +508,11 @@ def main() -> None:
             len(state.get("known_products", {})),
         )
 
+    in_maintenance = state.get("maintenance_mode", False)
     while True:
+        was_in_maintenance = in_maintenance
         try:
-            state = run_check(state)
+            state, in_maintenance = run_check(state)
             save_state(state)
         except Exception as e:
             log.exception("Unhandled error during check cycle")
@@ -402,9 +520,20 @@ def main() -> None:
                 f"{type(e).__name__}: {e}",
                 context="Unhandled error during check cycle",
             )
+            in_maintenance = state.get("maintenance_mode", False)
 
-        log.debug("Sleeping %ds until next check", POLL_INTERVAL_SECONDS)
-        time.sleep(POLL_INTERVAL_SECONDS)
+        # If we just transitioned from maintenance → up, skip the sleep and
+        # check again immediately so the new drop is announced as soon as it
+        # appears rather than waiting another poll interval.
+        if was_in_maintenance and not in_maintenance:
+            log.info("Recovery detected — re-checking immediately")
+            continue
+
+        interval = (
+            MAINTENANCE_POLL_INTERVAL_SECONDS if in_maintenance else POLL_INTERVAL_SECONDS
+        )
+        log.debug("Sleeping %ds until next check", interval)
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

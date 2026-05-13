@@ -12,6 +12,7 @@ Monitors the [Secret Lair](https://secretlair.wizards.com/us/) store and [Chaos 
 
 - Detects new product additions by tracking product IDs
 - Special "CHAOS VAULT IS OPEN" alert when the vault transitions from closed to active
+- Detects pre-release site downtime and fires a single "Releasing Soon" alert (instead of spamming for every failed poll), then polls faster so the new drop is announced quickly when the site returns
 - Rich Discord embeds with product name, price, and direct link
 - Persists state across restarts (won't re-notify on reboot)
 - First run silently catalogues existing products (no spam on initial deploy)
@@ -55,7 +56,9 @@ All config is via environment variables (set in `.env`):
 | Variable | Default | Description |
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | *(required)* | Discord webhook URL |
-| `POLL_INTERVAL_SECONDS` | `180` | Seconds between checks |
+| `POLL_INTERVAL_SECONDS` | `180` | Seconds between checks when the site is up |
+| `MAINTENANCE_POLL_INTERVAL_SECONDS` | `60` | Faster poll interval used while the site is down (pre-release window) |
+| `MAINTENANCE_STRIKE_THRESHOLD` | `2` | Consecutive failed checks required before declaring maintenance mode (filters transient blips) |
 | `MONITOR_SHOP_ALL` | `true` | Also monitor `/us/shopall` |
 | `NOTIFY_ON_START` | `false` | Notify for existing products on first run |
 | `LOG_LEVEL` | `INFO` | Log verbosity |
