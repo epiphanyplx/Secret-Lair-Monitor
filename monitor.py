@@ -8,6 +8,7 @@ then sends Discord webhook notifications when new items appear.
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -26,6 +27,27 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "180"))  # 3
 # so we catch the new drop quickly once it's back.
 MAINTENANCE_POLL_INTERVAL_SECONDS = int(
     os.environ.get("MAINTENANCE_POLL_INTERVAL_SECONDS", "60")
+)
+# Historical Secret Lair drops have gone live on the hour, so while in
+# maintenance mode we ramp up to a near-realtime poll for a few minutes on
+# either side of :00 and back off to the slower maintenance interval otherwise.
+MAINTENANCE_BURST_INTERVAL_SECONDS = int(
+    os.environ.get("MAINTENANCE_BURST_INTERVAL_SECONDS", "15")
+)
+MAINTENANCE_BURST_JITTER_SECONDS = int(
+    os.environ.get("MAINTENANCE_BURST_JITTER_SECONDS", "2")
+)
+# How many minutes before / after :00 to burst-poll.
+MAINTENANCE_BURST_WINDOW_BEFORE = int(
+    os.environ.get("MAINTENANCE_BURST_WINDOW_BEFORE", "2")
+)
+MAINTENANCE_BURST_WINDOW_AFTER = int(
+    os.environ.get("MAINTENANCE_BURST_WINDOW_AFTER", "2")
+)
+# Shorter request timeout while the site is down so a hung request can't eat
+# the whole poll interval.
+MAINTENANCE_REQUEST_TIMEOUT_SECONDS = int(
+    os.environ.get("MAINTENANCE_REQUEST_TIMEOUT_SECONDS", "10")
 )
 # How many consecutive failed checks before declaring maintenance mode. Filters
 # out transient network blips so we don't ping Discord for one-off failures.
@@ -92,7 +114,7 @@ def save_state(state: dict) -> None:
 PRODUCT_LINK_RE = re.compile(r"/us/product/(\d+)(?:/([^\"'\s]*))?")
 
 
-def fetch_page(url: str) -> str | None:
+def fetch_page(url: str, timeout: int = 30) -> str | None:
     """Fetch a page's HTML. Returns None on failure.
 
     Sends cache-busting headers so we don't get a stale 'we'll be right back'
@@ -107,7 +129,7 @@ def fetch_page(url: str) -> str | None:
     sep = "&" if "?" in url else "?"
     bust_url = f"{url}{sep}_={int(time.time())}"
     try:
-        resp = requests.get(bust_url, headers=headers, timeout=30)
+        resp = requests.get(bust_url, headers=headers, timeout=timeout)
         resp.raise_for_status()
         return resp.text
     except requests.RequestException as e:
@@ -392,6 +414,31 @@ def send_discord_error_notification(error_msg: str, context: str = "") -> bool:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def in_top_of_hour_burst_window() -> bool:
+    """True when the wall clock is in the configured top-of-hour burst window.
+
+    Minute-of-hour is the same across all whole-hour timezones, so we don't
+    need to know which timezone Wizards releases in.
+    """
+    minute = datetime.now().minute
+    return (
+        minute >= 60 - MAINTENANCE_BURST_WINDOW_BEFORE
+        or minute <= MAINTENANCE_BURST_WINDOW_AFTER
+    )
+
+
+def compute_sleep_interval(in_maintenance: bool) -> float:
+    """Pick the next sleep duration based on site state and clock position."""
+    if not in_maintenance:
+        return float(POLL_INTERVAL_SECONDS)
+    if in_top_of_hour_burst_window():
+        jitter = random.uniform(
+            -MAINTENANCE_BURST_JITTER_SECONDS, MAINTENANCE_BURST_JITTER_SECONDS
+        )
+        return max(1.0, MAINTENANCE_BURST_INTERVAL_SECONDS + jitter)
+    return float(MAINTENANCE_POLL_INTERVAL_SECONDS)
+
+
 def run_check(state: dict) -> tuple[dict, bool]:
     """Run one check cycle across all monitored pages.
 
@@ -403,10 +450,16 @@ def run_check(state: dict) -> tuple[dict, bool]:
     was_in_maintenance = state.get("maintenance_mode", False)
     strikes = state.get("maintenance_strikes", 0)
 
+    # While we were already in maintenance mode, use a tight request timeout so
+    # one hung connection can't blow past the burst-poll interval.
+    fetch_timeout = (
+        MAINTENANCE_REQUEST_TIMEOUT_SECONDS if was_in_maintenance else 30
+    )
+
     # Use the main store page as the canonical signal for site health. The
     # chaos vault page is legitimately empty most of the time, and shop_all
     # can lag, so we don't want either to be the trigger.
-    store_html = fetch_page(PAGES["store"])
+    store_html = fetch_page(PAGES["store"], timeout=fetch_timeout)
     store_down = store_html is None or is_maintenance_page(store_html)
 
     if store_down:
@@ -435,7 +488,7 @@ def run_check(state: dict) -> tuple[dict, bool]:
             html = store_html
         else:
             log.debug("Checking %s: %s", source, url)
-            html = fetch_page(url)
+            html = fetch_page(url, timeout=fetch_timeout)
             if html is None:
                 continue
 
@@ -529,10 +582,8 @@ def main() -> None:
             log.info("Recovery detected — re-checking immediately")
             continue
 
-        interval = (
-            MAINTENANCE_POLL_INTERVAL_SECONDS if in_maintenance else POLL_INTERVAL_SECONDS
-        )
-        log.debug("Sleeping %ds until next check", interval)
+        interval = compute_sleep_interval(in_maintenance)
+        log.debug("Sleeping %.1fs until next check", interval)
         time.sleep(interval)
 
 
