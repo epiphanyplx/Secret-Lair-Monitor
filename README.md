@@ -63,7 +63,7 @@ All config is via environment variables (set in `.env`):
 | `MAINTENANCE_BURST_WINDOW_BEFORE` | `2` | Minutes before :00 to start burst-polling |
 | `MAINTENANCE_BURST_WINDOW_AFTER` | `2` | Minutes after :00 to keep burst-polling |
 | `MAINTENANCE_REQUEST_TIMEOUT_SECONDS` | `10` | HTTP timeout while in maintenance mode (so a hung request can't eat a burst interval) |
-| `MAINTENANCE_STRIKE_THRESHOLD` | `2` | Consecutive failed checks required before declaring maintenance mode (filters transient blips) |
+| `MAINTENANCE_ALERT_AFTER_MINUTES` | `15` | Site must be continuously down this long before the "Releasing Soon" alert fires (filters routine maintenance windows) |
 | `MONITOR_SHOP_ALL` | `true` | Also monitor `/us/shopall` |
 | `NOTIFY_ON_START` | `false` | Notify for existing products on first run |
 | `LOG_LEVEL` | `INFO` | Log verbosity |

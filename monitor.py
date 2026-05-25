@@ -49,9 +49,12 @@ MAINTENANCE_BURST_WINDOW_AFTER = int(
 MAINTENANCE_REQUEST_TIMEOUT_SECONDS = int(
     os.environ.get("MAINTENANCE_REQUEST_TIMEOUT_SECONDS", "10")
 )
-# How many consecutive failed checks before declaring maintenance mode. Filters
-# out transient network blips so we don't ping Discord for one-off failures.
-MAINTENANCE_STRIKE_THRESHOLD = int(os.environ.get("MAINTENANCE_STRIKE_THRESHOLD", "2"))
+# How long the store must be continuously down before we treat it as a
+# pre-release maintenance window and fire the "Releasing Soon" alert. Brief
+# routine maintenance that recovers before this elapses sends nothing.
+MAINTENANCE_ALERT_AFTER_MINUTES = float(
+    os.environ.get("MAINTENANCE_ALERT_AFTER_MINUTES", "15")
+)
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 USER_AGENT = os.environ.get(
@@ -448,7 +451,6 @@ def run_check(state: dict) -> tuple[dict, bool]:
     known = state.get("known_products", {})
     chaos_vault_was_active = state.get("chaos_vault_active", False)
     was_in_maintenance = state.get("maintenance_mode", False)
-    strikes = state.get("maintenance_strikes", 0)
 
     # While we were already in maintenance mode, use a tight request timeout so
     # one hung connection can't blow past the burst-poll interval.
@@ -459,25 +461,41 @@ def run_check(state: dict) -> tuple[dict, bool]:
     # Use the main store page as the canonical signal for site health. The
     # chaos vault page is legitimately empty most of the time, and shop_all
     # can lag, so we don't want either to be the trigger.
+    now = datetime.now(timezone.utc)
     store_html = fetch_page(PAGES["store"], timeout=fetch_timeout)
     store_down = store_html is None or is_maintenance_page(store_html)
 
     if store_down:
-        strikes += 1
-        log.info(
-            "Secret Lair store appears down (strike %d/%d)",
-            strikes,
-            MAINTENANCE_STRIKE_THRESHOLD,
-        )
-        state["maintenance_strikes"] = strikes
-        if strikes >= MAINTENANCE_STRIKE_THRESHOLD and not was_in_maintenance:
+        # Track the start of a continuous outage. Only a sustained outage (vs.
+        # a brief maintenance blip) should trigger the alert.
+        down_since_raw = state.get("down_since")
+        if down_since_raw is None:
+            down_since = now
+            state["down_since"] = now.isoformat()
+            log.info("Secret Lair store appears down — starting outage timer")
+        else:
+            down_since = datetime.fromisoformat(down_since_raw)
+
+        down_minutes = (now - down_since).total_seconds() / 60.0
+        if not was_in_maintenance and down_minutes >= MAINTENANCE_ALERT_AFTER_MINUTES:
+            log.info(
+                "Store down %.1f min (>= %.0f) — entering maintenance mode",
+                down_minutes,
+                MAINTENANCE_ALERT_AFTER_MINUTES,
+            )
             send_release_soon_notification()
             state["maintenance_mode"] = True
-        state["last_check"] = datetime.now(timezone.utc).isoformat()
+        else:
+            log.info(
+                "Store down %.1f min (alert at %.0f min)",
+                down_minutes,
+                MAINTENANCE_ALERT_AFTER_MINUTES,
+            )
+        state["last_check"] = now.isoformat()
         return state, state.get("maintenance_mode", False)
 
-    # Site is up — reset strike counter and announce recovery if needed.
-    state["maintenance_strikes"] = 0
+    # Site is up — clear the outage timer and announce recovery if needed.
+    state["down_since"] = None
     if was_in_maintenance:
         log.info("Secret Lair site is back online — checking for new products")
         state["maintenance_mode"] = False
